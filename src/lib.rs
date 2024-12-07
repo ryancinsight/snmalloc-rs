@@ -29,7 +29,7 @@ extern crate snmalloc_sys as ffi;
 
 use core::{
     alloc::{GlobalAlloc, Layout},
-    ptr::NonNull,
+    ptr::{self,NonNull},
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -39,92 +39,110 @@ pub struct SnMalloc;
 unsafe impl Send for SnMalloc {}
 unsafe impl Sync for SnMalloc {}
 
+#[repr(align(16))]
+struct ZstSentinel;
+
+static ZST_SENTINEL: ZstSentinel = ZstSentinel;
+
 impl SnMalloc {
     #[inline(always)]
     pub const fn new() -> Self {
         Self
     }
 
-    /// Returns the available bytes in a memory block.
     #[inline(always)]
-    pub fn usable_size(&self, ptr: *const u8) -> Option<usize> {
-        match ptr.is_null() {
-            true => None,
-            false => Some(unsafe { ffi::sn_rust_usable_size(ptr.cast()) })
+    fn handle_zst(&self) -> NonNull<u8> {
+        unsafe { NonNull::new_unchecked(&ZST_SENTINEL as *const _ as *mut u8) }
+    }
+
+    /// Allocates memory with the given layout.
+    #[inline(always)]
+    pub fn safe_alloc(&self, layout: Layout) -> Option<NonNull<u8>> {
+        match layout.size() {
+            0 => Some(self.handle_zst()),
+            size => NonNull::new(unsafe { ffi::sn_rust_alloc(layout.align(), size) }.cast()),
         }
     }
 
+    /// Allocates zero-initialized memory with the given layout.
+    #[inline(always)]
+    pub fn safe_alloc_zeroed(&self, layout: Layout) -> Option<NonNull<u8>> {
+        match layout.size() {
+            0 => Some(self.handle_zst()),
+            size => NonNull::new(unsafe { ffi::sn_rust_alloc_zeroed(layout.align(), size) }.cast()),
+        }
+    }
+
+    /// Deallocates memory at the given pointer and layout.
+    #[inline(always)]
+    pub fn safe_dealloc(&self, ptr: *mut u8, layout: Layout) {
+        match (ptr.is_null(), layout.size()) {
+            (false, size) if size > 0 => unsafe {
+                ffi::sn_rust_dealloc(ptr.cast(), layout.align(), size);
+            },
+            _ => {} // No action needed for null pointers or ZSTs.
+        }
+    }
+
+    /// Reallocates memory at the given pointer and layout to a new size.
+    #[inline(always)]
+    pub fn safe_realloc(
+        &self,
+        ptr: *mut u8,
+        layout: Layout,
+        new_size: usize,
+    ) -> Option<NonNull<u8>> {
+        match (layout.size(), new_size) {
+            (0, 0) => Some(self.handle_zst()), // Both old and new sizes are zero.
+            (0, _) => self.safe_alloc(Layout::from_size_align(new_size, layout.align()).ok()?),
+            (_, 0) => {
+                self.safe_dealloc(ptr, layout);
+                None // New size is zero; deallocate and return None.
+            }
+            _ => NonNull::new(unsafe {
+                ffi::sn_rust_realloc(ptr.cast(), layout.align(), layout.size(), new_size).cast()
+            }),
+        }
+    }
     /// Allocates memory with the given layout, returning a non-null pointer on success
     #[inline(always)]
     pub fn alloc_aligned(&self, layout: Layout) -> Option<NonNull<u8>> {
         match layout.size() {
-            0 => NonNull::new(layout.align() as *mut u8),
+            0 => Some(self.handle_zst()),
             size => NonNull::new(unsafe { ffi::sn_rust_alloc(layout.align(), size) }.cast())
+        }
+    }
+    /// Returns the usable size of an allocated block.
+    #[inline(always)]
+    pub fn usable_size(&self, ptr: *const u8) -> Option<usize> {
+        match ptr.is_null() {
+            true => None,
+            false => Some(unsafe { ffi::sn_rust_usable_size(ptr.cast()) }),
         }
     }
 }
 
 unsafe impl GlobalAlloc for SnMalloc {
-    /// Allocate the memory with the given alignment and size.
-    /// On success, it returns a pointer pointing to the required memory address.
-    /// On failure, it returns a null pointer.
-    /// The client must assure the following things:
-    /// - `alignment` is greater than zero
-    /// - Other constrains are the same as the rust standard library.
-    ///
-    /// The program may be forced to abort if the constrains are not full-filled.
     #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        match layout.size() {
-            0 => layout.align() as *mut u8,
-            size => ffi::sn_rust_alloc(layout.align(), size).cast()
-        }
+        self.safe_alloc(layout).map_or(ptr::null_mut(), |ptr| ptr.as_ptr())
     }
 
-    /// De-allocate the memory at the given address with the given alignment and size.
-    /// The client must assure the following things:
-    /// - the memory is acquired using the same allocator and the pointer points to the start position.
-    /// - Other constrains are the same as the rust standard library.
-    ///
-    /// The program may be forced to abort if the constrains are not full-filled.
-    #[inline(always)]
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if layout.size() != 0 {
-            ffi::sn_rust_dealloc(ptr as _, layout.align(), layout.size());
-        }
-    }
-
-    /// Behaves like alloc, but also ensures that the contents are set to zero before being returned.
     #[inline(always)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        match layout.size() {
-            0 => layout.align() as *mut u8,
-            size => ffi::sn_rust_alloc_zeroed(layout.align(), size).cast()
-        }
+        self.safe_alloc_zeroed(layout)
+            .map_or(ptr::null_mut(), |ptr| ptr.as_ptr())
     }
 
-    /// Re-allocate the memory at the given address with the given alignment and size.
-    /// On success, it returns a pointer pointing to the required memory address.
-    /// The memory content within the `new_size` will remains the same as previous.
-    /// On failure, it returns a null pointer. In this situation, the previous memory is not returned to the allocator.
-    /// The client must assure the following things:
-    /// - the memory is acquired using the same allocator and the pointer points to the start position
-    /// - `alignment` fulfills all the requirements as `rust_alloc`
-    /// - Other constrains are the same as the rust standard library.
-    ///
-    /// The program may be forced to abort if the constrains are not full-filled.
+    #[inline(always)]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.safe_dealloc(ptr, layout);
+    }
+
     #[inline(always)]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        match new_size {
-            0 => {
-                self.dealloc(ptr, layout);
-                layout.align() as *mut u8
-            }
-            new_size if layout.size() == 0 => {
-                self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()))
-            }
-            _ => ffi::sn_rust_realloc(ptr.cast(), layout.align(), layout.size(), new_size).cast()
-        }
+        self.safe_realloc(ptr, layout, new_size)
+            .map_or(ptr::null_mut(), |ptr| ptr.as_ptr())
     }
 }
 
@@ -158,10 +176,9 @@ mod tests {
     }
     #[test]
     fn it_frees_allocated_memory() {
+        let alloc = SnMalloc::new();
         unsafe {
             let layout = Layout::from_size_align(8, 8).unwrap();
-            let alloc = SnMalloc;
-
             let ptr = alloc.alloc(layout);
             alloc.dealloc(ptr, layout);
         }
@@ -169,9 +186,9 @@ mod tests {
 
     #[test]
     fn it_frees_zero_allocated_memory() {
+        let alloc = SnMalloc::new();
         unsafe {
             let layout = Layout::from_size_align(8, 8).unwrap();
-            let alloc = SnMalloc;
 
             let ptr = alloc.alloc_zeroed(layout);
             alloc.dealloc(ptr, layout);
@@ -180,9 +197,9 @@ mod tests {
 
     #[test]
     fn it_frees_reallocated_memory() {
+        let alloc = SnMalloc::new();
         unsafe {
             let layout = Layout::from_size_align(8, 8).unwrap();
-            let alloc = SnMalloc;
 
             let ptr = alloc.alloc(layout);
             let ptr = alloc.realloc(ptr, layout, 16);
@@ -192,9 +209,9 @@ mod tests {
 
     #[test]
     fn it_frees_large_alloc() {
+        let alloc = SnMalloc::new();
         unsafe {
             let layout = Layout::from_size_align(1 << 20, 32).unwrap();
-            let alloc = SnMalloc;
 
             let ptr = alloc.alloc(layout);
             alloc.dealloc(ptr, layout);
@@ -212,4 +229,17 @@ mod tests {
             assert!(usz >= 8);
         }
     }
+    
+    #[test]
+    fn test_zero_sized_allocation() {
+        let alloc = SnMalloc::new();
+        let zst_layout = Layout::from_size_align(0, 1).unwrap();
+
+        unsafe {
+            let ptr = alloc.alloc(zst_layout);
+            assert!(!ptr.is_null());
+            alloc.dealloc(ptr, zst_layout);
+        }
+    }
+
 }
